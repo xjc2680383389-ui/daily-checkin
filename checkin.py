@@ -9,11 +9,16 @@ import json
 import os
 import sys
 from datetime import date, timedelta
+import calendar
 from calendar import monthrange, monthcalendar
+
+# 修复：Python calendar 默认周一起始，与表头「日 一 二 三 四 五 六」错位一天。
+# 统一为周日起始后，monthcalendar 的行列与表头、周日红字判断全部对齐。
+calendar.setfirstweekday(calendar.SUNDAY)
 
 # ── 配置 ──────────────────────────────────────────────
 APP_TITLE = "每日打卡"
-WIN_W, WIN_H = 480, 620
+WIN_W, WIN_H = 480, 1040  # 修复：620 太矮，内容所需 1007px，底部统计/按钮会被裁掉
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".daily-checkin")
 DATA_FILE = os.path.join(DATA_DIR, "checkins.json")
 
