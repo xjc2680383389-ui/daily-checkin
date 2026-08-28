@@ -10,11 +10,9 @@ import os
 import sys
 from datetime import date, timedelta
 import calendar
-from calendar import monthrange, monthcalendar
 
-# 修复：Python calendar 默认周一起始，与表头「日 一 二 三 四 五 六」错位一天。
-# 统一为周日起始后，monthcalendar 的行列与表头、周日红字判断全部对齐。
-calendar.setfirstweekday(calendar.SUNDAY)
+# 使用局部 Calendar 实例避免修改全局 calendar 模块状态
+_cal = calendar.Calendar(firstweekday=calendar.SUNDAY)
 
 # ── 配置 ──────────────────────────────────────────────
 APP_TITLE = "每日打卡"
@@ -40,7 +38,9 @@ def load_data() -> dict[str, bool]:
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, IOError) as e:
+            import tkinter.messagebox as mb
+            mb.showwarning("数据加载失败", f"打卡数据文件损坏，已创建新数据文件。\n\n错误: {e}")
             return {}
     return {}
 
@@ -76,13 +76,18 @@ class CheckinApp:
         self.window = ctk.CTk()
         self.window.title(APP_TITLE)
         self.window.configure(fg_color=WIN_BG)
-        self.window.resizable(False, False)
+        self.window.resizable(True, True)
+        self.window.minsize(400, 800)
 
-        # 居中
+        # 居中并适配屏幕
         self.window.update_idletasks()
-        x = (self.window.winfo_screenwidth() - WIN_W) // 2
-        y = (self.window.winfo_screenheight() - WIN_H) // 2
-        self.window.geometry(f"{WIN_W}x{WIN_H}+{x}+{y}")
+        screen_w = self.window.winfo_screenwidth()
+        screen_h = self.window.winfo_screenheight()
+        win_w = min(WIN_W, int(screen_w * 0.9))
+        win_h = min(WIN_H, int(screen_h * 0.9))
+        x = (screen_w - win_w) // 2
+        y = (screen_h - win_h) // 2
+        self.window.geometry(f"{win_w}x{win_h}+{x}+{y}")
 
         # 图标（尝试设置）
         try:
@@ -279,8 +284,7 @@ class CheckinApp:
         """根据 current_year/month 渲染日历按钮"""
         self.label_month.configure(text=f"{self.current_year}年 {self.current_month}月")
 
-        cal = monthcalendar(self.current_year, self.current_month)
-        # monthcalendar 返回的是 Sun-Sat，与我们的 header 一致
+        cal = _cal.monthdayscalendar(self.current_year, self.current_month)
 
         for row_idx, week in enumerate(cal):
             for col_idx, day in enumerate(week):
@@ -302,7 +306,8 @@ class CheckinApp:
                     is_today = cell_date == self.today
                     is_checked = self.data.get(date_key(cell_date), False)
                     is_future = cell_date > self.today
-                    is_weekend = col_idx == 0  # 周日
+                    is_weekend_sun = col_idx == 0  # 周日
+                    is_weekend_sat = col_idx == 6  # 周六
 
                     # 基础样式
                     if is_checked:
@@ -312,7 +317,12 @@ class CheckinApp:
                     else:
                         bg = CARD_BG
                         hover_bg = "#e9ecef"
-                        text_color = WEEKEND_COLOR if is_weekend else "#2c3e50"
+                        if is_weekend_sun:
+                            text_color = WEEKEND_COLOR
+                        elif is_weekend_sat:
+                            text_color = "#e67e22"
+                        else:
+                            text_color = "#2c3e50"
 
                     # 今日边框
                     border_w = 2 if is_today else 0
@@ -383,10 +393,10 @@ class CheckinApp:
         streak = calc_streak(self.data, self.today)
         self.stat_value_labels["streak"].configure(text=f"{streak} 天")
 
-        # 本月打卡
+        # 本月打卡（始终显示当前真实月份）
         monthly = sum(
             1 for k in self.data
-            if k.startswith(f"{self.current_year}-{self.current_month:02d}")
+            if k.startswith(f"{self.today.year}-{self.today.month:02d}")
         )
         self.stat_value_labels["monthly"].configure(text=f"{monthly} 天")
 
