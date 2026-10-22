@@ -8,6 +8,8 @@ import customtkinter as ctk
 import json
 import os
 import sys
+import tempfile
+from contextlib import contextmanager
 from datetime import date, timedelta
 import calendar
 
@@ -34,21 +36,58 @@ WEEKDAYS_CN = ["日", "一", "二", "三", "四", "五", "六"]
 
 # ── 数据持久化 ────────────────────────────────────────
 def load_data() -> dict[str, bool]:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            import tkinter.messagebox as mb
-            mb.showwarning("数据加载失败", f"打卡数据文件损坏，已创建新数据文件。\n\n错误: {e}")
-            return {}
-    return {}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("打卡数据必须是日期与布尔值组成的对象")
+    for key, value in data.items():
+        if date.fromisoformat(key).isoformat() != key or not isinstance(value, bool):
+            raise ValueError("打卡数据含有无效日期或状态")
+    return data
 
 
 def save_data(data: dict[str, bool]) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=DATA_DIR,
+                                         suffix=".tmp", delete=False) as f:
+            temporary = f.name
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, DATA_FILE)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+@contextmanager
+def data_lock():
+    """在同一个锁内重新读取、修改和保存，避免多个窗口互相覆盖。"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(DATA_FILE + ".lock", "a+b") as lock:
+        if os.fstat(lock.fileno()).st_size == 0:
+            lock.write(b"\0")
+            lock.flush()
+        lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 # ── 工具函数 ──────────────────────────────────────────
@@ -96,7 +135,13 @@ class CheckinApp:
             pass
 
         # 状态
-        self.data = load_data()
+        try:
+            self.data = load_data()
+        except (OSError, ValueError) as e:
+            import tkinter.messagebox as mb
+            mb.showerror("数据加载失败", f"原数据文件已保留，请先检查或恢复备份。\n\n{DATA_FILE}\n{e}", parent=self.window)
+            self.window.destroy()
+            raise
         self.today = date.today()
         self.current_year = self.today.year
         self.current_month = self.today.month
@@ -105,6 +150,7 @@ class CheckinApp:
         self._build_ui()
         self._render_calendar()
         self._update_stats()
+        self.window.after(15000, self._refresh_today)
 
     # ── UI 构建 ───────────────────────────────────
     def _build_ui(self):
@@ -285,6 +331,7 @@ class CheckinApp:
         self.label_month.configure(text=f"{self.current_year}年 {self.current_month}月")
 
         cal = _cal.monthdayscalendar(self.current_year, self.current_month)
+        cal += [[0] * 7 for _ in range(6 - len(cal))]
 
         for row_idx, week in enumerate(cal):
             for col_idx, day in enumerate(week):
@@ -353,21 +400,33 @@ class CheckinApp:
     # ── 打卡切换 ─────────────────────────────────
     def _toggle_day(self, d: date):
         """点击日期：切换打卡状态"""
+        self.today = date.today()
         if d > self.today:
             return  # 未来日期不可打卡
 
         key = date_key(d)
-        if self.data.get(key):
-            del self.data[key]
+        try:
+            with data_lock():
+                data = load_data()
+                cancelled = data.get(key, False)
+                if cancelled:
+                    del data[key]
+                else:
+                    data[key] = True
+                save_data(data)
+        except (OSError, ValueError) as e:
+            import tkinter.messagebox as mb
+            mb.showerror("打卡未保存", f"原记录和界面状态已保留。请检查数据文件或磁盘后重试。\n\n{e}", parent=self.window)
+            return
+        self.data = data
+        if cancelled:
             self.status_label.configure(text=f"⏎ 已取消 {d.month}月{d.day}日 打卡")
         else:
-            self.data[key] = True
             if d == self.today:
                 self.status_label.configure(text=f"✅ 今日打卡成功！继续坚持！")
             else:
                 self.status_label.configure(text=f"✅ 已补卡 {d.month}月{d.day}日")
 
-        save_data(self.data)
         self._render_calendar()
         self._update_stats()
 
@@ -375,6 +434,8 @@ class CheckinApp:
     def _navigate(self, delta: int):
         """delta: 月份增量（-1=上月, +1=下月, -12=去年, +12=明年）"""
         total_months = self.current_year * 12 + (self.current_month - 1) + delta
+        if not 12 <= total_months < 10000 * 12:
+            return
         self.current_year = total_months // 12
         self.current_month = (total_months % 12) + 1
         self._render_calendar()
@@ -382,10 +443,22 @@ class CheckinApp:
 
     # ── 回到今天 ─────────────────────────────────
     def _go_today(self):
+        self.today = date.today()
         self.current_year = self.today.year
         self.current_month = self.today.month
         self._render_calendar()
         self._update_stats()
+
+    def _refresh_today(self):
+        current = date.today()
+        if current != self.today:
+            was_current = (self.current_year, self.current_month) == (self.today.year, self.today.month)
+            self.today = current
+            if was_current:
+                self.current_year, self.current_month = current.year, current.month
+            self._render_calendar()
+            self._update_stats()
+        self.window.after(15000, self._refresh_today)
 
     # ── 统计更新 ─────────────────────────────────
     def _update_stats(self):
@@ -395,13 +468,13 @@ class CheckinApp:
 
         # 本月打卡（始终显示当前真实月份）
         monthly = sum(
-            1 for k in self.data
-            if k.startswith(f"{self.today.year}-{self.today.month:02d}")
+            1 for k, checked in self.data.items()
+            if checked and k.startswith(f"{self.today.year}-{self.today.month:02d}-")
         )
         self.stat_value_labels["monthly"].configure(text=f"{monthly} 天")
 
         # 总计
-        total = len(self.data)
+        total = sum(self.data.values())
         self.stat_value_labels["total"].configure(text=f"{total} 天")
 
     # ── 启动 ────────────────────────────────────
@@ -413,5 +486,8 @@ class CheckinApp:
 if __name__ == "__main__":
     ctk.set_appearance_mode("light")
     ctk.set_default_color_theme("blue")
-    app = CheckinApp()
+    try:
+        app = CheckinApp()
+    except (OSError, ValueError):
+        sys.exit(1)
     app.run()
